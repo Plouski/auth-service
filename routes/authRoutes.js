@@ -1,8 +1,25 @@
 const express = require('express');
 const passport = require('passport');
+const AuthController = require('../controllers/authController');
 const OAuthController = require('../controllers/oauthController');
+const authValidators = require('../middlewares/authValidators');
+const { authMiddleware } = require('../middlewares/authMiddleware');
 
 const router = express.Router();
+
+// Routes d'authentification standard
+router.post('/register', authValidators.register, AuthController.register);
+router.post('/login', authValidators.login, AuthController.login);
+router.post('/refresh-token', authValidators.refreshToken, AuthController.refreshToken);
+router.post('/verify-token', AuthController.verifyToken);
+
+// Route protégée pour tester l'authentification
+router.get('/me', authMiddleware, (req, res) => {
+  res.status(200).json({
+    user: req.user,
+    message: 'Authentification valide'
+  });
+});
 
 // Routes OAuth Google
 router.get('/oauth/google', (req, res, next) => {
