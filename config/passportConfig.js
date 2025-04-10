@@ -96,7 +96,19 @@ class PassportConfig {
       const response = await axios.post(url, data);
       console.log(`[OAuth] Réponse ${provider}:`, response.data);
 
-      return response.data.user;
+      return {
+        ...response.data,
+        user: {
+          id: response.data.id,
+          email: response.data.email,
+          firstName: response.data.firstName,
+          lastName: response.data.lastName,
+          role: response.data.role,
+          isNewUser: response.data.isNewUser
+        },
+        accessToken: response.data.accessToken,
+        refreshToken: response.data.refreshToken
+      };
     } catch (error) {
       throw error;
     }
