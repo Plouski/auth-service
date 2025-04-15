@@ -2,8 +2,9 @@ const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const FacebookStrategy = require('passport-facebook').Strategy;
 const GitHubStrategy = require("passport-github").Strategy;
-const axios = require('axios');
 const logger = require('../utils/logger');
+const User = require('../models/User');
+const JwtConfig = require('../config/jwtConfig');
 
 class PassportConfig {
   static initializeStrategies() {
@@ -28,7 +29,7 @@ class PassportConfig {
       clientSecret: process.env.FACEBOOK_CLIENT_SECRET,
       callbackURL: process.env.FACEBOOK_CALLBACK_URL,
       profileFields: ['id', 'emails', 'name'],
-      passReqToCallback: true
+      enableProof: true
     }, async (req, accessToken, refreshToken, profile, done) => {
       try {
         const user = await PassportConfig.handleOAuth('facebook', profile);
@@ -61,66 +62,108 @@ class PassportConfig {
 
     passport.deserializeUser(async (id, done) => {
       try {
-        const response = await axios.get(`${process.env.DATA_SERVICE_URL}/users/${id}`);
-        done(null, response.data);
+        const user = await User.findById(id).select('-password');
+        done(null, user);
       } catch (error) {
         done(error);
       }
     });
   }
 
-  // Fonction générique pour traiter l'OAuth
   static async handleOAuth(provider, profile) {
-    try {
-      let email = '';
-      if (Array.isArray(profile.emails) && profile.emails.length > 0) {
-        email = profile.emails.find(e => e.verified)?.value || profile.emails[0].value;
-      } else {
-        email = `${profile.id}@${provider}.oauth`;
+    let email = null;
+  
+    if (provider === 'github') {
+      const res = await fetch('https://api.github.com/user/emails', {
+        headers: {
+          Authorization: `token ${profile.accessToken}`,
+          'User-Agent': 'OAuth App'
+        }
+      });
+  
+      const emails = await res.json();
+      if (Array.isArray(emails)) {
+        const primary = emails.find(e => e.primary && e.verified);
+        const any = emails.find(e => e.verified);
+        email = primary?.email || any?.email;
       }
-
-      const firstName = profile.name?.givenName || profile.displayName || '';
-      const lastName = profile.name?.familyName || '';
-
-      const providerIdKey = `${provider}Id`;
-      const data = {
-        email,
-        firstName,
-        lastName,
-        [providerIdKey]: profile.id
-      };
-
-      const url = `${process.env.DATA_SERVICE_URL}/oauth/${provider}`;
-      console.log(`[OAuth] Appel à ${url} avec:`, data);
-
-      const response = await axios.post(url, data);
-      console.log(`[OAuth] Réponse ${provider}:`, response.data);
-
-      return {
-        ...response.data,
-        user: {
-          id: response.data.id,
-          email: response.data.email,
-          firstName: response.data.firstName,
-          lastName: response.data.lastName,
-          role: response.data.role,
-          isNewUser: response.data.isNewUser
-        },
-        accessToken: response.data.accessToken,
-        refreshToken: response.data.refreshToken
-      };
-    } catch (error) {
-      throw error;
-    }
-  }
-
-  // Gestion des erreurs centralisée
-  static handleOAuthError(provider, error, done) {
-    if (error.response) {
-      console.error(`❌ Erreur OAuth ${provider} – ${error.response.status}:`, error.response.data);
     } else {
-      console.error(`❌ Erreur OAuth ${provider}:`, error.message);
+      email = Array.isArray(profile.emails) && profile.emails.length > 0
+        ? (profile.emails.find(e => e.verified)?.value || profile.emails[0].value)
+        : null;
     }
+  
+    if (!email) {
+      email = `oauth_${provider}_${profile.id}@fake.email`;
+      logger.warn(`⚠️ Email manquant dans le profil ${provider}, email généré: ${email}`);
+    }
+  
+    const displayName = profile.displayName || '';
+    const [firstSplit, ...restSplit] = displayName.trim().split(' ');
+  
+    const rawFirstName = profile.name?.givenName || firstSplit || null;
+    const rawLastName = profile.name?.familyName || restSplit.join(' ') || null;
+  
+    const clean = str => (typeof str === 'string' && str.trim() !== '' ? str.trim() : null);
+  
+    const firstName = clean(rawFirstName) || 'Utilisateur';
+    const lastName = clean(rawLastName) || 'OAuth';
+  
+    if (!rawFirstName || !rawLastName) {
+      logger.warn(`⚠️ Prénom ou nom manquant dans le profil ${provider} (${email}), fallback utilisé : ${firstName} ${lastName}`);
+    }
+  
+    let user = await User.findOne({ email });
+    let isNewUser = false;
+  
+    if (!user) {
+      isNewUser = true;
+      try {
+        user = new User({
+          email,
+          firstName,
+          lastName,
+          isVerified: true,
+          oauth: {
+            provider,
+            providerId: profile.id
+          },
+          createdAt: new Date()
+        });
+        await user.save();
+      } catch (err) {
+        if (err.code === 11000) {
+          user = await User.findOne({ email });
+          isNewUser = false;
+        } else {
+          throw err;
+        }
+      }
+    } else if (!user.oauth || user.oauth.providerId !== profile.id) {
+      user.oauth = {
+        provider,
+        providerId: profile.id
+      };
+      await user.save();
+    }
+  
+    const accessToken = JwtConfig.generateAccessToken(user);
+    const refreshToken = JwtConfig.generateRefreshToken(user);
+  
+    return {
+      user: {
+        ...user.toJSON(),
+        isNewUser
+      },
+      accessToken,
+      refreshToken
+    };
+  }
+  
+  
+
+  static handleOAuthError(provider, error, done) {
+    logger.error(`❌ Erreur OAuth ${provider}:`, error);
     return done(error, false);
   }
 }

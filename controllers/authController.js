@@ -1,9 +1,10 @@
-// controllers/authController.js - Complet
-const axios = require('axios');
 const bcrypt = require('bcryptjs');
 const { validationResult } = require('express-validator');
+const User = require('../models/User');
 const JwtConfig = require('../config/jwtConfig');
 const logger = require('../utils/logger');
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 class AuthController {
   /**
@@ -19,54 +20,56 @@ class AuthController {
 
       const { email, password, firstName, lastName } = req.body;
 
-      // Création de l'utilisateur via le service de données
-      const userData = {
-        email,
-        password,
-        firstName,
-        lastName
-      };
-
       logger.info('Tentative de création d\'utilisateur', { email });
 
-      // Envoi de la requête au service de données
-      let response;
-      try {
-        response = await axios.post(
-          `${process.env.DATA_SERVICE_URL}/users/register`,
-          userData
-        );
-      } catch (dataServiceError) {
-        // Gestion spécifique si l'email existe déjà
-        if (dataServiceError.response && dataServiceError.response.status === 409) {
-          return res.status(409).json({
-            message: 'Cet email est déjà utilisé'
-          });
-        }
-        throw dataServiceError;
+      // Vérifier si l'utilisateur existe déjà
+      const existingUser = await User.findOne({ email });
+      if (existingUser) {
+        return res.status(409).json({
+          message: 'Cet email est déjà utilisé'
+        });
       }
 
-      const user = response.data.user;
+      // Hachage du mot de passe
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(password, salt);
+
+      // Création du token de vérification
+      const verificationToken = crypto.randomBytes(32).toString('hex');
+
+      // Création de l'utilisateur
+      const newUser = new User({
+        email,
+        password: hashedPassword,
+        firstName,
+        lastName,
+        verificationToken,
+        isVerified: false,
+        createdAt: new Date()
+      });
+
+      // Sauvegarde de l'utilisateur dans la base de données
+      await newUser.save();
 
       // Générer les tokens
-      const accessToken = JwtConfig.generateAccessToken(user);
-      const refreshToken = JwtConfig.generateRefreshToken(user);
+      const accessToken = JwtConfig.generateAccessToken(newUser);
+      const refreshToken = JwtConfig.generateRefreshToken(newUser);
 
       // Journaliser l'inscription
-      logger.logAuthEvent('register', { userId: user._id, email });
+      logger.logAuthEvent('register', { userId: newUser._id, email });
 
       // Envoyer des notifications de confirmation de compte
       try {
-        await AuthController.sendVerificationNotifications(user);
-        logger.info(`Notifications de vérification envoyées pour ${email}`);
+        await AuthController.sendVerificationEmail(newUser);
+        logger.info(`Email de vérification envoyé pour ${email}`);
       } catch (notificationError) {
         // Ne pas bloquer l'inscription si les notifications échouent
-        logger.warn(`Échec d'envoi des notifications pour ${email}`, notificationError);
+        logger.warn(`Échec d'envoi de l'email de vérification pour ${email}`, notificationError);
       }
 
       // Envoyer un email de bienvenue
       try {
-        await AuthController.sendWelcomeEmail(user._id);
+        await AuthController.sendWelcomeEmail(newUser);
         logger.info(`Email de bienvenue envoyé pour ${email}`);
       } catch (welcomeError) {
         // Ne pas bloquer l'inscription si l'email échoue
@@ -76,10 +79,10 @@ class AuthController {
       res.status(201).json({
         message: 'Utilisateur créé avec succès',
         user: {
-          id: user._id,
-          email: user.email,
-          firstName: user.firstName,
-          lastName: user.lastName
+          id: newUser._id,
+          email: newUser.email,
+          firstName: newUser.firstName,
+          lastName: newUser.lastName
         },
         tokens: {
           accessToken,
@@ -107,45 +110,39 @@ class AuthController {
 
       logger.info('Tentative de connexion', { email });
 
-      // Utiliser directement l'endpoint de login du data-service
-      try {
-        const response = await axios.post(
-          `${process.env.DATA_SERVICE_URL}/users/login`,
-          { email, password }
-        );
-
-        // Extraire les données de réponse
-        const { user, token } = response.data;
-
-        // Générer nos propres tokens JWT
-        const accessToken = JwtConfig.generateAccessToken(user);
-        const refreshToken = JwtConfig.generateRefreshToken(user);
-
-        logger.logAuthEvent('login', { userId: user._id || user.id, email });
-
-        res.status(200).json({
-          message: 'Connexion réussie',
-          user: {
-            id: user._id || user.id,
-            email: user.email,
-            firstName: user.firstName,
-            lastName: user.lastName,
-            role: user.role
-          },
-          tokens: {
-            accessToken,
-            refreshToken
-          }
-        });
-      } catch (error) {
-        if (error.response && error.response.status === 400) {
-          return res.status(400).json({ message: error.response.data.message });
-        }
-        if (error.response && error.response.status === 401) {
-          return res.status(401).json({ message: 'Email ou mot de passe incorrect' });
-        }
-        throw error;
+      // Rechercher l'utilisateur
+      const user = await User.findOne({ email });
+      if (!user) {
+        return res.status(401).json({ message: 'Email ou mot de passe incorrect' });
       }
+
+      // Vérifier le mot de passe
+      const isPasswordValid = await bcrypt.compare(password, user.password);
+      if (!isPasswordValid) {
+        return res.status(401).json({ message: 'Email ou mot de passe incorrect' });
+      }
+
+      // Générer les tokens
+      const accessToken = JwtConfig.generateAccessToken(user);
+      const refreshToken = JwtConfig.generateRefreshToken(user);
+
+      // Journaliser la connexion
+      logger.logAuthEvent('login', { userId: user._id, email });
+
+      res.status(200).json({
+        message: 'Connexion réussie',
+        user: {
+          id: user._id,
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          role: user.role
+        },
+        tokens: {
+          accessToken,
+          refreshToken
+        }
+      });
     } catch (error) {
       logger.error('Erreur lors de la connexion', error);
       next(error);
@@ -213,59 +210,96 @@ class AuthController {
   }
 
   /**
-   * Méthode pour envoyer des notifications de vérification de compte
+   * Méthode pour envoyer un email de vérification
    */
-  // static async sendVerificationNotifications(user) {
-  //   try {
-  //     if (!user || !user.email) {
-  //       throw new Error('Utilisateur invalide');
-  //     }
+  static async sendVerificationEmail(user) {
+    try {
+      if (!user || !user.email || !user.verificationToken) {
+        throw new Error('Utilisateur ou token de vérification invalide');
+      }
 
-  //     // Appeler le service de notification
-  //     const response = await axios.post(
-  //       `${process.env.NOTIFICATION_SERVICE_URL || 'http://localhost:5003'}/notifications/account-verification`,
-  //       { email: user.email },
-  //       {
-  //         headers: {
-  //           'Content-Type': 'application/json'
-  //         }
-  //       }
-  //     );
+      // Créer un transporteur de mail
+      const transporter = nodemailer.createTransport({
+        host: process.env.SMTP_HOST,
+        port: process.env.SMTP_PORT,
+        secure: process.env.SMTP_SECURE === 'true',
+        auth: {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASSWORD
+        }
+      });
 
-  //     return response.data;
-  //   } catch (error) {
-  //     logger.error(`Échec d'envoi des notifications de vérification pour ${user.email}`, error);
-  //     throw error;
-  //   }
-  // }
+      // URL de vérification
+      const verificationUrl = `${process.env.FRONTEND_URL}/verify-account?token=${user.verificationToken}`;
+
+      // Envoyer l'email
+      await transporter.sendMail({
+        from: `"${process.env.EMAIL_FROM_NAME}" <${process.env.EMAIL_FROM_ADDRESS}>`,
+        to: user.email,
+        subject: 'Vérification de votre compte',
+        html: `
+          <h1>Vérification de votre compte</h1>
+          <p>Bonjour ${user.firstName},</p>
+          <p>Merci de vous être inscrit. Veuillez cliquer sur le lien ci-dessous pour vérifier votre compte :</p>
+          <p><a href="${verificationUrl}">Vérifier mon compte</a></p>
+          <p>Ce lien expire dans 24 heures.</p>
+        `
+      });
+
+      return true;
+    } catch (error) {
+      logger.error(`Échec d'envoi de l'email de vérification pour ${user.email}`, error);
+      throw error;
+    }
+  }
 
   /**
    * Méthode pour envoyer un email de bienvenue
    */
-  // static async sendWelcomeEmail(userId) {
-  //   try {
-  //     if (!userId) {
-  //       throw new Error('ID utilisateur requis');
-  //     }
-
-  //     // Appeler le service de notification
-  //     const response = await axios.post(
-  //       `${process.env.NOTIFICATION_SERVICE_URL || 'http://localhost:5003'}/notifications/welcome`,
-  //       { userId },
-  //       {
-  //         headers: {
-  //           'Content-Type': 'application/json',
-  //           'x-api-key': process.env.SERVICE_API_KEY
-  //         }
-  //       }
-  //     );
-
-  //     return response.data;
-  //   } catch (error) {
-  //     logger.error(`Échec d'envoi de l'email de bienvenue pour l'utilisateur ${userId}`, error);
-  //     throw error;
-  //   }
-  // }
+  static async sendWelcomeEmail(userOrId) {
+    try {
+      let user = userOrId;
+  
+      if (typeof userOrId === 'string') {
+        user = await User.findById(userOrId);
+      }
+  
+      if (!user || !user.email) {
+        throw new Error('Utilisateur invalide');
+      }
+  
+      // Créer un transporteur de mail
+      const transporter = require('nodemailer').createTransport({
+        host: process.env.SMTP_HOST,
+        port: process.env.SMTP_PORT,
+        secure: process.env.SMTP_SECURE === 'true',
+        auth: {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASSWORD
+        }
+      });
+  
+      // Envoyer l'email
+      await transporter.sendMail({
+        from: `"${process.env.EMAIL_FROM_NAME}" <${process.env.EMAIL_FROM_ADDRESS}>`,
+        to: user.email,
+        subject: 'Bienvenue sur notre plateforme',
+        html: `
+          <h1>Bienvenue !</h1>
+          <p>Bonjour ${user.firstName || ''},</p>
+          <p>Merci de vous être inscrit sur notre plateforme. Nous sommes ravis de vous compter parmi nos utilisateurs.</p>
+          <p>Pour commencer à utiliser nos services, connectez-vous à votre compte :</p>
+          <p><a href="${process.env.FRONTEND_URL}/login">Se connecter</a></p>
+          <p>L'équipe</p>
+        `
+      });
+  
+      return true;
+    } catch (error) {
+      logger.error(`Échec d'envoi de l'email de bienvenue pour ${userOrId}`, error);
+      throw error;
+    }
+  }  
 
   /**
    * Méthode pour gérer la vérification de compte
@@ -280,30 +314,38 @@ class AuthController {
         });
       }
 
-      try {
-        // Appeler le service de données pour vérifier le token
-        const response = await axios.post(
-          `${process.env.DATA_SERVICE_URL}/users/verify-account`,
-          { token },
-          {
-            headers: {
-              'Content-Type': 'application/json'
-            }
-          }
-        );
-
-        res.status(200).json({
-          message: 'Compte vérifié avec succès',
-          user: response.data.user
+      // Rechercher l'utilisateur par token de vérification
+      const user = await User.findOne({ verificationToken: token });
+      if (!user) {
+        return res.status(400).json({
+          message: 'Token de vérification invalide'
         });
-      } catch (error) {
-        if (error.response && error.response.status === 400) {
-          return res.status(400).json({
-            message: error.response.data.message || 'Token de vérification invalide'
-          });
-        }
-        throw error;
       }
+
+      // Vérifier si le token n'est pas expiré (24h après création)
+      const tokenCreationTime = user.createdAt || new Date(Date.now() - 25 * 60 * 60 * 1000); // Par défaut 25h pour être sûr
+      const expirationTime = new Date(tokenCreationTime.getTime() + 24 * 60 * 60 * 1000);
+
+      if (Date.now() > expirationTime) {
+        return res.status(400).json({
+          message: 'Token de vérification expiré'
+        });
+      }
+
+      // Mettre à jour l'utilisateur
+      user.isVerified = true;
+      user.verificationToken = undefined;
+      await user.save();
+
+      res.status(200).json({
+        message: 'Compte vérifié avec succès',
+        user: {
+          id: user._id,
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName
+        }
+      });
     } catch (error) {
       logger.error('Erreur lors de la vérification du compte', error);
       next(error);
@@ -323,32 +365,56 @@ class AuthController {
         });
       }
 
-      try {
-        // Appeler le service de notification
-        await axios.post(
-          `${process.env.NOTIFICATION_SERVICE_URL || '5005'}/notifications/password-reset`,
-          { email },
-          {
-            headers: {
-              'Content-Type': 'application/json'
+      // Rechercher l'utilisateur
+      const user = await User.findOne({ email });
+
+      // Même si l'utilisateur n'existe pas, ne pas révéler cette information
+      if (user) {
+        // Générer un code de réinitialisation
+        const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+        const resetCodeExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 heure
+
+        // Mettre à jour l'utilisateur
+        user.resetCode = resetCode;
+        user.resetCodeExpires = resetCodeExpires;
+        await user.save();
+
+        try {
+          // Envoyer l'email de réinitialisation
+          // Créer un transporteur de mail
+          const transporter = nodemailer.createTransport({
+            host: process.env.SMTP_HOST,
+            port: process.env.SMTP_PORT,
+            secure: process.env.SMTP_SECURE === 'true',
+            auth: {
+              user: process.env.SMTP_USER,
+              pass: process.env.SMTP_PASSWORD
             }
-          }
-        );
+          });
 
-        // Par sécurité, ne pas indiquer si l'email existe ou non
-        res.status(200).json({
-          message: 'Si cet email est associé à un compte, des instructions ont été envoyées.'
-        });
-      } catch (error) {
-        logger.error('Échec de l’envoi de l’e-mail de réinitialisation', error.message);
-        // Même si ça échoue, ne pas indiquer que l'email existe
-        res.status(200).json({
-          message: 'Si cet email est associé à un compte, des instructions ont été envoyées.'
-        });
-
-        // Mais logger l'erreur
-        logger.error(`Échec d'envoi des instructions de réinitialisation pour ${email}`, error);
+          // Envoyer l'email
+          await transporter.sendMail({
+            from: `"${process.env.EMAIL_FROM_NAME}" <${process.env.EMAIL_FROM_ADDRESS}>`,
+            to: user.email,
+            subject: 'Réinitialisation de votre mot de passe',
+            html: `
+              <h1>Réinitialisation de mot de passe</h1>
+              <p>Bonjour,</p>
+              <p>Vous avez demandé la réinitialisation de votre mot de passe. Voici votre code de réinitialisation :</p>
+              <h2>${resetCode}</h2>
+              <p>Ce code expire dans 1 heure.</p>
+              <p>Si vous n'avez pas demandé cette réinitialisation, ignorez cet email.</p>
+            `
+          });
+        } catch (emailError) {
+          logger.error(`Échec d'envoi de l'email de réinitialisation pour ${email}`, emailError);
+        }
       }
+
+      // Par sécurité, ne pas indiquer si l'email existe ou non
+      res.status(200).json({
+        message: 'Si cet email est associé à un compte, des instructions ont été envoyées.'
+      });
     } catch (error) {
       logger.error('Erreur lors de l\'initiation de la réinitialisation de mot de passe', error);
       next(error);
@@ -368,33 +434,32 @@ class AuthController {
         });
       }
 
-      try {
-        // Appeler le service de données pour réinitialiser le mot de passe
-        const response = await axios.post(
-          `${process.env.DATA_SERVICE_URL}/users/reset-password`,
-          {
-            email,
-            resetCode,
-            newPassword
-          },
-          {
-            headers: {
-              'Content-Type': 'application/json'
-            }
-          }
-        );
+      // Rechercher l'utilisateur
+      const user = await User.findOne({
+        email,
+        resetCode,
+        resetCodeExpires: { $gt: Date.now() }
+      });
 
-        res.status(200).json({
-          message: 'Mot de passe réinitialisé avec succès'
+      if (!user) {
+        return res.status(400).json({
+          message: 'Code de réinitialisation invalide ou expiré'
         });
-      } catch (error) {
-        if (error.response && error.response.status === 400) {
-          return res.status(400).json({
-            message: error.response.data.message || 'Code de réinitialisation invalide'
-          });
-        }
-        throw error;
       }
+
+      // Hachage du nouveau mot de passe
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+      // Mettre à jour l'utilisateur
+      user.password = hashedPassword;
+      user.resetCode = undefined;
+      user.resetCodeExpires = undefined;
+      await user.save();
+
+      res.status(200).json({
+        message: 'Mot de passe réinitialisé avec succès'
+      });
     } catch (error) {
       logger.error('Erreur lors de la réinitialisation du mot de passe', error);
       next(error);
@@ -428,29 +493,29 @@ class AuthController {
    */
   static async getProfile(req, res, next) {
     try {
+      const userId = req.user.userId;
 
-      try {
-        // Appeler le service de données pour récupérer le profil
-        const response = await axios.get(
-          `${process.env.DATA_SERVICE_URL}/users/profile`,
-          {
-            headers: {
-              Authorization: `Bearer ${req.headers.authorization?.split(' ')[1]}`
-            }
-          }
-        );
-
-        res.status(200).json({
-          user: response.data
+      // Rechercher l'utilisateur
+      const user = await User.findById(userId).select('-password -resetCode -resetCodeExpires -verificationToken');
+      if (!user) {
+        return res.status(404).json({
+          message: 'Profil utilisateur non trouvé'
         });
-      } catch (error) {
-        if (error.response && error.response.status === 404) {
-          return res.status(404).json({
-            message: 'Profil utilisateur non trouvé'
-          });
-        }
-        throw error;
       }
+
+      res.status(200).json({
+        user: {
+          id: user._id,
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          phoneNumber: user.phoneNumber,
+          role: user.role,
+          isVerified: user.isVerified,
+          createdAt: user.createdAt,
+          updatedAt: user.updatedAt
+        }
+      });
     } catch (error) {
       logger.error('Erreur lors de la récupération du profil', error);
       next(error);
@@ -462,7 +527,7 @@ class AuthController {
    */
   static async updateProfile(req, res, next) {
     try {
-
+      const userId = req.user.userId;
       const { firstName, lastName, phoneNumber } = req.body;
 
       // Valider les entrées
@@ -471,35 +536,34 @@ class AuthController {
         return res.status(400).json({ errors: errors.array() });
       }
 
-      // Construire l'objet de mise à jour
-      const updateData = {};
-      if (firstName !== undefined) updateData.firstName = firstName;
-      if (lastName !== undefined) updateData.lastName = lastName;
-      if (phoneNumber !== undefined) updateData.phoneNumber = phoneNumber;
-
-      try {
-        // Appeler le service de données pour mettre à jour le profil
-        const response = await axios.put(
-          `${process.env.DATA_SERVICE_URL}/users/profile`,
-          updateData,
-          {
-            headers: {
-              Authorization: `Bearer ${req.headers.authorization?.split(' ')[1]}`
-            }
-          }
-        );
-        res.status(200).json({
-          message: 'Profil mis à jour avec succès',
-          user: response.data
+      // Rechercher l'utilisateur
+      const user = await User.findById(userId);
+      if (!user) {
+        return res.status(404).json({
+          message: 'Profil utilisateur non trouvé'
         });
-      } catch (error) {
-        if (error.response && error.response.status === 404) {
-          return res.status(404).json({
-            message: 'Profil utilisateur non trouvé'
-          });
-        }
-        throw error;
       }
+
+      // Mettre à jour les champs
+      if (firstName !== undefined) user.firstName = firstName;
+      if (lastName !== undefined) user.lastName = lastName;
+      if (phoneNumber !== undefined) user.phoneNumber = phoneNumber;
+
+      user.updatedAt = new Date();
+      await user.save();
+
+      res.status(200).json({
+        message: 'Profil mis à jour avec succès',
+        user: {
+          id: user._id,
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          phoneNumber: user.phoneNumber,
+          role: user.role,
+          isVerified: user.isVerified
+        }
+      });
     } catch (error) {
       logger.error('Erreur lors de la mise à jour du profil', error);
       next(error);
@@ -521,80 +585,73 @@ class AuthController {
         });
       }
 
-      try {
-        // Appeler le service de données pour changer le mot de passe
-        const response = await axios.put(
-          `${process.env.DATA_SERVICE_URL}/users/change-password`,
-          {
-            currentPassword,
-            newPassword
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${req.headers.authorization?.split(' ')[1]}`
-            }
-          }
-        );
-
-        logger.info(`Mot de passe changé pour l'utilisateur ${userId}`);
-
-        res.status(200).json({
-          message: 'Mot de passe changé avec succès'
-        });
-      } catch (error) {
-        if (error.response) {
-          if (error.response.status === 404) {
-            return res.status(404).json({
-              message: 'Utilisateur non trouvé'
-            });
-          } else if (error.response.status === 401) {
-            return res.status(401).json({
-              message: 'Mot de passe actuel incorrect'
-            });
-          }
-        }
-        throw error;
-      }
-    } catch (error) {
-      if (error.response?.status === 500 && error.response?.data?.message?.includes('mot de passe')) {
-        return res.status(400).json({
-          message: error.response.data.message
-        });
-      }
-
-      logger.error('Erreur lors du changement de mot de passe', error);
-      return next(error);
-    }
-  }
-
-  /**
- * Méthode pour supprimer le compte d'un utilisateur
- */
-  static async deleteUser(req, res, next) {
-    try {
-      // Appeler le service de données pour supprimer le compte
-      const response = await axios.delete(
-        `${process.env.DATA_SERVICE_URL}/users/account`,
-        {
-          headers: {
-            Authorization: `Bearer ${req.headers.authorization?.split(' ')[1]}`
-          }
-        }
-      );
-
-      return res.status(200).json({
-        user: response.data
-      });
-
-    } catch (error) {
-      if (error.response && error.response.status === 404) {
+      // Rechercher l'utilisateur
+      const user = await User.findById(userId);
+      if (!user) {
         return res.status(404).json({
           message: 'Utilisateur non trouvé'
         });
       }
 
+      // Vérifier le mot de passe actuel
+      const isPasswordValid = await bcrypt.compare(currentPassword, user.password);
+      if (!isPasswordValid) {
+        return res.status(401).json({
+          message: 'Mot de passe actuel incorrect'
+        });
+      }
+
+      // Vérifier que le nouveau mot de passe est différent
+      const isSamePassword = await bcrypt.compare(newPassword, user.password);
+      if (isSamePassword) {
+        return res.status(400).json({
+          message: 'Le nouveau mot de passe doit être différent du mot de passe actuel'
+        });
+      }
+
+      // Hachage du nouveau mot de passe
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+      // Mettre à jour l'utilisateur
+      user.password = hashedPassword;
+      user.updatedAt = new Date();
+      await user.save();
+
+      logger.info(`Mot de passe changé pour l'utilisateur ${userId}`);
+
+      res.status(200).json({
+        message: 'Mot de passe changé avec succès'
+      });
+    } catch (error) {
+      logger.error('Erreur lors du changement de mot de passe', error);
+      next(error);
+    }
+  }
+
+  /**
+   * Méthode pour supprimer le compte d'un utilisateur
+   */
+  static async deleteUser(req, res, next) {
+    try {
+      const userId = req.user.userId;
+
+      // Rechercher et supprimer l'utilisateur
+      const user = await User.findByIdAndDelete(userId);
+      if (!user) {
+        return res.status(404).json({
+          message: 'Utilisateur non trouvé'
+        });
+      }
+
+      logger.info(`Compte supprimé pour l'utilisateur ${userId}`);
+
+      res.status(200).json({
+        message: 'Compte supprimé avec succès'
+      });
+    } catch (error) {
       logger.error('Erreur lors de la suppression du compte', error);
-      return next(error);
+      next(error);
     }
   }
 
@@ -607,29 +664,55 @@ class AuthController {
         return res.status(401).json({ message: 'Authentification OAuth échouée' });
       }
 
-      const user = req.user.user || req.user;
-      const accessToken = req.user.accessToken;
-      const refreshToken = req.user.refreshToken;
-      const userId = user._id || user.id;
+      const { id, email, firstName, lastName, provider } = req.user;
+      let user;
+      let isNewUser = false;
 
+      // Rechercher l'utilisateur par email
+      user = await User.findOne({ email });
 
-      if (!accessToken) {
-        // fallback si jamais tu veux le régénérer ici (optionnel)
-        accessToken = JwtConfig.generateAccessToken(user);
+      if (!user) {
+        // Créer un nouvel utilisateur
+        isNewUser = true;
+        user = new User({
+          email,
+          firstName: firstName || '',
+          lastName: lastName || '',
+          isVerified: true, // L'email est vérifié par le fournisseur OAuth
+          oauth: {
+            provider,
+            providerId: id
+          },
+          createdAt: new Date()
+        });
+        await user.save();
+      } else {
+        // Mettre à jour les infos OAuth si nécessaire
+        if (!user.oauth || user.oauth.provider !== provider) {
+          user.oauth = {
+            provider,
+            providerId: id
+          };
+          await user.save();
+        }
       }
 
+      // Générer les tokens
+      const accessToken = JwtConfig.generateAccessToken(user);
+      const refreshToken = JwtConfig.generateRefreshToken(user);
+
       logger.logAuthEvent('oauth_login', {
-        userId,
-        provider: user.oauth?.provider || 'auth'
+        userId: user._id,
+        provider
       });
 
       // Si c'est une première connexion, envoyer un email de bienvenue
-      if (user.isNewUser) {
+      if (isNewUser) {
         try {
-          await AuthController.sendWelcomeEmail(userId);
-          logger.info(`Email de bienvenue envoyé à ${user.email}`);
+          await AuthController.sendWelcomeEmail(user);
+          logger.info(`Email de bienvenue envoyé à ${email}`);
         } catch (err) {
-          logger.warn(`Échec de l'envoi de l'email de bienvenue à ${user.email}`, err);
+          logger.warn(`Échec de l'envoi de l'email de bienvenue à ${email}`, err);
         }
       }
 
@@ -640,7 +723,7 @@ class AuthController {
         return res.status(200).json({
           message: 'Authentification OAuth réussie',
           user: {
-            id: userId,
+            id: user._id,
             email: user.email,
             firstName: user.firstName,
             lastName: user.lastName,
@@ -650,7 +733,7 @@ class AuthController {
             accessToken,
             refreshToken
           }
-        });        
+        });
       }
 
       // Redirection avec token (pour client web classique)
@@ -659,24 +742,11 @@ class AuthController {
       redirectUrl.searchParams.set('token', accessToken);
 
       return res.redirect(redirectUrl.toString());
-
-      // Option cookie sécurisé (à activer si tu veux)
-      /*
-      res.cookie('refreshToken', refreshToken, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: 7 * 24 * 60 * 60 * 1000 // 7 jours
-      });
-      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/oauth-callback`);
-      */
-
     } catch (error) {
       logger.error('Erreur lors du traitement de l\'authentification OAuth', error);
-      return next(error);
+      next(error);
     }
   }
-
 }
 
 module.exports = AuthController;

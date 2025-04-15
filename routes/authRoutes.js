@@ -1,87 +1,159 @@
 const express = require('express');
 const passport = require('passport');
+const { body } = require('express-validator');
 const AuthController = require('../controllers/authController');
-const OAuthController = require('../controllers/oauthController');
-const { validationResult } = require('express-validator');
 const { authMiddleware } = require('../middlewares/authMiddleware');
-const authValidators = require('../middlewares/authValidators');
-const validateRequest = require('../middlewares/validateRequest');
 
 const router = express.Router();
 
-// Standard Authentication Routes
-//OK
-router.post('/register', 
-  authValidators.register, 
-  validateRequest,
-  (req, res, next) => AuthController.register(req, res, next)
+/**
+ * @route   POST /auth/register
+ * @desc    Enregistrer un nouvel utilisateur
+ * @access  Public
+ */
+router.post(
+  '/register',
+  [
+    body('email').isEmail().withMessage('Adresse email invalide'),
+    body('password')
+      .isLength({ min: 8 })
+      .withMessage('Le mot de passe doit contenir au moins 8 caractères')
+      .matches(/\d/)
+      .withMessage('Le mot de passe doit contenir au moins un chiffre')
+      .matches(/[A-Z]/)
+      .withMessage('Le mot de passe doit contenir au moins une lettre majuscule'),
+    body('firstName').notEmpty().withMessage('Le prénom est requis'),
+    body('lastName').notEmpty().withMessage('Le nom est requis')
+  ],
+  AuthController.register
 );
 
-//OK
-router.post('/login', 
-  authValidators.login, 
-  validateRequest,
-  (req, res, next) => AuthController.login(req, res, next)
+/**
+ * @route   POST /auth/login
+ * @desc    Connexion d'un utilisateur
+ * @access  Public
+ */
+router.post(
+  '/login',
+  [
+    body('email').isEmail().withMessage('Adresse email invalide'),
+    body('password').notEmpty().withMessage('Le mot de passe est requis')
+  ],
+  AuthController.login
 );
 
-router.post('/refresh-token', 
-  authValidators.refreshToken, 
-  validateRequest,
-  (req, res, next) => AuthController.refreshToken(req, res, next)
+/**
+ * @route   POST /auth/refresh-token
+ * @desc    Rafraîchir le token d'accès
+ * @access  Public
+ */
+router.post('/refresh-token', AuthController.refreshToken);
+
+/**
+ * @route   POST /auth/verify-token
+ * @desc    Vérifier la validité d'un token
+ * @access  Public
+ */
+router.post('/verify-token', AuthController.verifyToken);
+
+/**
+ * @route   POST /auth/verify-account
+ * @desc    Vérifier un compte avec un token
+ * @access  Public
+ */
+router.post('/verify-account', AuthController.verifyAccount);
+
+/**
+ * @route   POST /auth/forgot-password
+ * @desc    Initier une réinitialisation de mot de passe
+ * @access  Public
+ */
+router.post(
+  '/forgot-password',
+  [
+    body('email').isEmail().withMessage('Adresse email invalide')
+  ],
+  AuthController.initiatePasswordReset
 );
 
-router.post('/verify-token',
-  validateRequest,
-  (req, res, next) => AuthController.verifyToken(req, res, next)
+/**
+ * @route   POST /auth/reset-password
+ * @desc    Réinitialiser le mot de passe avec un code
+ * @access  Public
+ */
+router.post(
+  '/reset-password',
+  [
+    body('email').isEmail().withMessage('Adresse email invalide'),
+    body('resetCode').notEmpty().withMessage('Le code de réinitialisation est requis'),
+    body('newPassword')
+      .isLength({ min: 8 })
+      .withMessage('Le mot de passe doit contenir au moins 8 caractères')
+      .matches(/\d/)
+      .withMessage('Le mot de passe doit contenir au moins un chiffre')
+      .matches(/[A-Z]/)
+      .withMessage('Le mot de passe doit contenir au moins une lettre majuscule')
+  ],
+  AuthController.resetPassword
 );
 
-router.post('/verify-account',
-  validateRequest,
-  (req, res, next) => AuthController.verifyAccount(req, res, next)
+/**
+ * @route   POST /auth/logout
+ * @desc    Déconnexion d'un utilisateur
+ * @access  Private
+ */
+router.post('/logout', authMiddleware, AuthController.logout);
+
+/**
+ * @route   GET /auth/profile
+ * @desc    Récupérer le profil de l'utilisateur connecté
+ * @access  Private
+ */
+router.get('/profile', authMiddleware, AuthController.getProfile);
+
+/**
+ * @route   PUT /auth/profile
+ * @desc    Mettre à jour le profil de l'utilisateur
+ * @access  Private
+ */
+router.put(
+  '/profile',
+  [
+    authMiddleware,
+    body('firstName').optional().notEmpty().withMessage('Le prénom ne peut pas être vide'),
+    body('lastName').optional().notEmpty().withMessage('Le nom ne peut pas être vide'),
+    body('phoneNumber').optional().isMobilePhone().withMessage('Numéro de téléphone invalide')
+  ],
+  AuthController.updateProfile
 );
 
-router.post('/initiate-password-reset',
-  validateRequest,
-  (req, res, next) => AuthController.initiatePasswordReset(req, res, next)
+/**
+ * @route   PUT /auth/change-password
+ * @desc    Changer le mot de passe de l'utilisateur
+ * @access  Private
+ */
+router.put(
+  '/change-password',
+  [
+    authMiddleware,
+    body('currentPassword').notEmpty().withMessage('Le mot de passe actuel est requis'),
+    body('newPassword')
+      .isLength({ min: 8 })
+      .withMessage('Le mot de passe doit contenir au moins 8 caractères')
+      .matches(/\d/)
+      .withMessage('Le mot de passe doit contenir au moins un chiffre')
+      .matches(/[A-Z]/)
+      .withMessage('Le mot de passe doit contenir au moins une lettre majuscule')
+  ],
+  AuthController.changePassword
 );
 
-router.post('/reset-password',
-  validateRequest,
-  (req, res, next) => AuthController.resetPassword(req, res, next)
-);
-
-//OK
-router.post('/logout', 
-  authMiddleware,
-  (req, res, next) => AuthController.logout(req, res, next)
-);
-
-//OK
-router.get('/profile', 
-  authMiddleware, 
-  (req, res, next) => AuthController.getProfile(req, res, next)
-);
-
-//OK
-router.put('/profile', 
-  authMiddleware,
-  validateRequest,
-  (req, res, next) => AuthController.updateProfile(req, res, next)
-);
-
-//OK
-router.put('/change-password', 
-  authMiddleware,
-  validateRequest,
-  (req, res, next) => AuthController.changePassword(req, res, next)
-);
-
-//OK
-router.delete('/account', 
-  authMiddleware,
-  validateRequest,
-  (req, res, next) => AuthController.deleteUser(req, res, next)
-);
+/**
+ * @route   DELETE /auth/account
+ * @desc    Supprimer le compte de l'utilisateur
+ * @access  Private
+ */
+router.delete('/account', authMiddleware, AuthController.deleteUser);
 
 // OAuth Routes
 //OK
@@ -110,7 +182,8 @@ router.get('/oauth/google/callback',
 //OK
 router.get('/oauth/facebook',
   passport.authenticate('facebook', {
-    scope: ['email']
+    scope: ['email'],
+    auth_type: "rerequest"
   })
 );
 
