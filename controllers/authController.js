@@ -5,6 +5,8 @@ const JwtConfig = require('../config/jwtConfig');
 const logger = require('../utils/logger');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const normalizeOAuthProfile = require('../utils/normalizeOAuthProfile');
+const Subscription = require('../models/Subscription');
 
 class AuthController {
   /**
@@ -259,15 +261,15 @@ class AuthController {
   static async sendWelcomeEmail(userOrId) {
     try {
       let user = userOrId;
-  
+
       if (typeof userOrId === 'string') {
         user = await User.findById(userOrId);
       }
-  
+
       if (!user || !user.email) {
         throw new Error('Utilisateur invalide');
       }
-  
+
       // Créer un transporteur de mail
       const transporter = require('nodemailer').createTransport({
         host: process.env.SMTP_HOST,
@@ -278,7 +280,7 @@ class AuthController {
           pass: process.env.SMTP_PASSWORD
         }
       });
-  
+
       // Envoyer l'email
       await transporter.sendMail({
         from: `"${process.env.EMAIL_FROM_NAME}" <${process.env.EMAIL_FROM_ADDRESS}>`,
@@ -293,13 +295,13 @@ class AuthController {
           <p>L'équipe</p>
         `
       });
-  
+
       return true;
     } catch (error) {
       logger.error(`Échec d'envoi de l'email de bienvenue pour ${userOrId}`, error);
       throw error;
     }
-  }  
+  }
 
   /**
    * Méthode pour gérer la vérification de compte
@@ -494,7 +496,7 @@ class AuthController {
   static async getProfile(req, res, next) {
     try {
       const userId = req.user.userId;
-
+  
       // Rechercher l'utilisateur
       const user = await User.findById(userId).select('-password -resetCode -resetCodeExpires -verificationToken');
       if (!user) {
@@ -502,7 +504,13 @@ class AuthController {
           message: 'Profil utilisateur non trouvé'
         });
       }
-
+  
+      // Récupérer l'abonnement actif
+      const subscription = await Subscription.findOne({
+        userId,
+        status: 'active'
+      }).select('plan status startDate endDate');
+  
       res.status(200).json({
         user: {
           id: user._id,
@@ -513,7 +521,9 @@ class AuthController {
           role: user.role,
           isVerified: user.isVerified,
           createdAt: user.createdAt,
-          updatedAt: user.updatedAt
+          updatedAt: user.updatedAt,
+          authProvider: user.oauth?.provider || 'local',
+          subscription: subscription || null
         }
       });
     } catch (error) {
@@ -530,27 +540,24 @@ class AuthController {
       const userId = req.user.userId;
       const { firstName, lastName, phoneNumber } = req.body;
 
-      // Valider les entrées
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
       }
 
-      // Rechercher l'utilisateur
       const user = await User.findById(userId);
       if (!user) {
-        return res.status(404).json({
-          message: 'Profil utilisateur non trouvé'
-        });
+        return res.status(404).json({ message: 'Profil utilisateur non trouvé' });
       }
 
-      // Mettre à jour les champs
-      if (firstName !== undefined) user.firstName = firstName;
-      if (lastName !== undefined) user.lastName = lastName;
-      if (phoneNumber !== undefined) user.phoneNumber = phoneNumber;
+      const allowedUpdates = { firstName, lastName, phoneNumber };
+      for (const key in allowedUpdates) {
+        if (allowedUpdates[key] !== undefined) {
+          user[key] = allowedUpdates[key];
+        }
+      }
 
-      user.updatedAt = new Date();
-      await user.save();
+      await user.save(); // ✅ updatedAt sera mis à jour automatiquement
 
       res.status(200).json({
         message: 'Profil mis à jour avec succès',
@@ -561,7 +568,8 @@ class AuthController {
           lastName: user.lastName,
           phoneNumber: user.phoneNumber,
           role: user.role,
-          isVerified: user.isVerified
+          isVerified: user.isVerified,
+          createdAt: user.createdAt // ← utile si tu veux la réafficher
         }
       });
     } catch (error) {
@@ -664,70 +672,25 @@ class AuthController {
         return res.status(401).json({ message: 'Authentification OAuth échouée' });
       }
 
-      const { id, email, firstName, lastName, provider } = req.user;
-      let user;
-      let isNewUser = false;
+      // ✅ Corrigé : extraire les bonnes valeurs
+      const { user, accessToken, refreshToken } = req.user;
+      const { _id, email, firstName, lastName, role, avatar } = user;
 
-      // Rechercher l'utilisateur par email
-      user = await User.findOne({ email });
+      logger.logAuthEvent('oauth_login', { userId: _id, provider: user.oauth?.provider });
 
-      if (!user) {
-        // Créer un nouvel utilisateur
-        isNewUser = true;
-        user = new User({
-          email,
-          firstName: firstName || '',
-          lastName: lastName || '',
-          isVerified: true, // L'email est vérifié par le fournisseur OAuth
-          oauth: {
-            provider,
-            providerId: id
-          },
-          createdAt: new Date()
-        });
-        await user.save();
-      } else {
-        // Mettre à jour les infos OAuth si nécessaire
-        if (!user.oauth || user.oauth.provider !== provider) {
-          user.oauth = {
-            provider,
-            providerId: id
-          };
-          await user.save();
-        }
-      }
-
-      // Générer les tokens
-      const accessToken = JwtConfig.generateAccessToken(user);
-      const refreshToken = JwtConfig.generateRefreshToken(user);
-
-      logger.logAuthEvent('oauth_login', {
-        userId: user._id,
-        provider
-      });
-
-      // Si c'est une première connexion, envoyer un email de bienvenue
-      if (isNewUser) {
-        try {
-          await AuthController.sendWelcomeEmail(user);
-          logger.info(`Email de bienvenue envoyé à ${email}`);
-        } catch (err) {
-          logger.warn(`Échec de l'envoi de l'email de bienvenue à ${email}`, err);
-        }
-      }
-
+      // Redirection JSON ou vers frontend
       const isApiClient = req.get('Accept') === 'application/json';
 
       if (isApiClient) {
-        // Réponse JSON pour un client SPA/mobile
         return res.status(200).json({
           message: 'Authentification OAuth réussie',
           user: {
-            id: user._id,
-            email: user.email,
-            firstName: user.firstName,
-            lastName: user.lastName,
-            role: user.role
+            id: _id,
+            email,
+            firstName,
+            lastName,
+            role,
+            avatar
           },
           tokens: {
             accessToken,
@@ -736,12 +699,12 @@ class AuthController {
         });
       }
 
-      // Redirection avec token (pour client web classique)
       const redirectUrl = new URL(process.env.FRONTEND_URL || 'http://localhost:3000');
       redirectUrl.pathname = '/oauth-callback';
       redirectUrl.searchParams.set('token', accessToken);
 
       return res.redirect(redirectUrl.toString());
+
     } catch (error) {
       logger.error('Erreur lors du traitement de l\'authentification OAuth', error);
       next(error);

@@ -39,12 +39,12 @@ console.log('🔥 Lancement du serveur...');
     }));
 
     // Rate limiting
-    const limiter = rateLimit({
-      windowMs: 15 * 60 * 1000, // 15 minutes
-      max: 100,
-      message: 'Trop de requêtes, veuillez réessayer plus tard'
-    });
-    app.use(limiter);
+    // const limiter = rateLimit({
+    //   windowMs: 15 * 60 * 1000, // 15 minutes
+    //   max: 100,
+    //   message: 'Trop de requêtes, veuillez réessayer plus tard'
+    // });
+    // app.use(limiter);
 
     // Passport
     app.use(passport.initialize());

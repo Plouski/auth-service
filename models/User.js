@@ -58,6 +58,8 @@ const UserSchema = new Schema({
     type: Date,
     default: Date.now
   }
+}, {
+  timestamps: true
 });
 
 // Méthode pour vérifier si un utilisateur est admin
