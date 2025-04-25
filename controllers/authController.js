@@ -1,10 +1,21 @@
 const bcrypt = require('bcryptjs');
 const { validationResult } = require('express-validator');
 const User = require('../models/User');
+const Subscription = require('../models/Subscription');
 const JwtConfig = require('../config/jwtConfig');
 const logger = require('../utils/logger');
 const crypto = require('crypto');
-const nodemailer = require('nodemailer');
+const NotificationService = require("../services/notificationService");
+
+function sanitizeError(err) {
+  const sanitized = {
+    message: err.message,
+    stack: err.stack
+  };
+  if (err.response?.data) sanitized.response = err.response.data;
+  if (err.response?.status) sanitized.status = err.response.status;
+  return sanitized;
+}
 
 class AuthController {
   /**
@@ -12,7 +23,6 @@ class AuthController {
    */
   static async register(req, res, next) {
     try {
-      // Validation des entrées
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
@@ -22,22 +32,16 @@ class AuthController {
 
       logger.info('Tentative de création d\'utilisateur', { email });
 
-      // Vérifier si l'utilisateur existe déjà
       const existingUser = await User.findOne({ email });
       if (existingUser) {
-        return res.status(409).json({
-          message: 'Cet email est déjà utilisé'
-        });
+        return res.status(409).json({ message: 'Cet email est déjà utilisé' });
       }
 
-      // Hachage du mot de passe
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password, salt);
 
-      // Création du token de vérification
       const verificationToken = crypto.randomBytes(32).toString('hex');
 
-      // Création de l'utilisateur
       const newUser = new User({
         email,
         password: hashedPassword,
@@ -48,85 +52,73 @@ class AuthController {
         createdAt: new Date()
       });
 
-      // Sauvegarde de l'utilisateur dans la base de données
       await newUser.save();
 
-      // Générer les tokens
       const accessToken = JwtConfig.generateAccessToken(newUser);
       const refreshToken = JwtConfig.generateRefreshToken(newUser);
 
-      // Journaliser l'inscription
       logger.logAuthEvent('register', { userId: newUser._id, email });
 
-      // Envoyer des notifications de confirmation de compte
-      try {
-        await AuthController.sendVerificationEmail(newUser);
-        logger.info(`Email de vérification envoyé pour ${email}`);
-      } catch (notificationError) {
-        // Ne pas bloquer l'inscription si les notifications échouent
-        logger.warn(`Échec d'envoi de l'email de vérification pour ${email}`, notificationError);
-      }
+      // Tentative d'envoi de l'email de confirmation (sans bloquer l'inscription)
+      Promise.race([
+        NotificationService.sendConfirmationEmail(newUser.email, newUser.verificationToken),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("⏳ Timeout Mailjet")), 6000))
+      ]).then(() => {
+        console.log("✅ Email de vérification envoyé");
+        logger.info(`✅ Email de vérification envoyé via notification-service pour ${email}`);
+      }).catch((notificationError) => {
+        logger.warn(`⚠️ Échec de l'envoi de l'email via notification-service`, sanitizeError(notificationError));
+      });
 
-      // Envoyer un email de bienvenue
-      try {
-        await AuthController.sendWelcomeEmail(newUser);
-        logger.info(`Email de bienvenue envoyé pour ${email}`);
-      } catch (welcomeError) {
-        // Ne pas bloquer l'inscription si l'email échoue
-        logger.warn(`Échec d'envoi de l'email de bienvenue pour ${email}`, welcomeError);
-      }
-
-      res.status(201).json({
-        message: 'Utilisateur créé avec succès',
+      return res.status(201).json({
+        message: "Utilisateur créé avec succès. Vérifiez votre boîte mail.",
         user: {
           id: newUser._id,
           email: newUser.email,
           firstName: newUser.firstName,
-          lastName: newUser.lastName
+          lastName: newUser.lastName,
         },
         tokens: {
           accessToken,
-          refreshToken
-        }
+          refreshToken,
+        },
       });
     } catch (error) {
-      logger.error('Erreur lors de l\'inscription', error);
+      logger.error("Erreur complète:", sanitizeError(error));
       next(error);
     }
   }
 
   /**
-   * Connexion d'un utilisateur
+   * Connexion d'un utilisateur (avec vérification de l'email)
    */
   static async login(req, res, next) {
     try {
-      // Validation des entrées
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
       }
 
       const { email, password } = req.body;
-
       logger.info('Tentative de connexion', { email });
 
-      // Rechercher l'utilisateur
       const user = await User.findOne({ email });
       if (!user) {
         return res.status(401).json({ message: 'Email ou mot de passe incorrect' });
       }
 
-      // Vérifier le mot de passe
       const isPasswordValid = await bcrypt.compare(password, user.password);
       if (!isPasswordValid) {
         return res.status(401).json({ message: 'Email ou mot de passe incorrect' });
       }
 
-      // Générer les tokens
+      if (!user.isVerified) {
+        return res.status(403).json({ message: "Veuillez confirmer votre adresse email avant de vous connecter." });
+      }
+
       const accessToken = JwtConfig.generateAccessToken(user);
       const refreshToken = JwtConfig.generateRefreshToken(user);
 
-      // Journaliser la connexion
       logger.logAuthEvent('login', { userId: user._id, email });
 
       res.status(200).json({
@@ -144,7 +136,7 @@ class AuthController {
         }
       });
     } catch (error) {
-      logger.error('Erreur lors de la connexion', error);
+      logger.error('Erreur lors de la connexion', sanitizeError(error));
       next(error);
     }
   }
@@ -210,110 +202,16 @@ class AuthController {
   }
 
   /**
-   * Méthode pour envoyer un email de vérification
-   */
-  static async sendVerificationEmail(user) {
-    try {
-      if (!user || !user.email || !user.verificationToken) {
-        throw new Error('Utilisateur ou token de vérification invalide');
-      }
-
-      // Créer un transporteur de mail
-      const transporter = nodemailer.createTransport({
-        host: process.env.SMTP_HOST,
-        port: process.env.SMTP_PORT,
-        secure: process.env.SMTP_SECURE === 'true',
-        auth: {
-          user: process.env.SMTP_USER,
-          pass: process.env.SMTP_PASSWORD
-        }
-      });
-
-      // URL de vérification
-      const verificationUrl = `${process.env.FRONTEND_URL}/verify-account?token=${user.verificationToken}`;
-
-      // Envoyer l'email
-      await transporter.sendMail({
-        from: `"${process.env.EMAIL_FROM_NAME}" <${process.env.EMAIL_FROM_ADDRESS}>`,
-        to: user.email,
-        subject: 'Vérification de votre compte',
-        html: `
-          <h1>Vérification de votre compte</h1>
-          <p>Bonjour ${user.firstName},</p>
-          <p>Merci de vous être inscrit. Veuillez cliquer sur le lien ci-dessous pour vérifier votre compte :</p>
-          <p><a href="${verificationUrl}">Vérifier mon compte</a></p>
-          <p>Ce lien expire dans 24 heures.</p>
-        `
-      });
-
-      return true;
-    } catch (error) {
-      logger.error(`Échec d'envoi de l'email de vérification pour ${user.email}`, error);
-      throw error;
-    }
-  }
-
-  /**
-   * Méthode pour envoyer un email de bienvenue
-   */
-  static async sendWelcomeEmail(userOrId) {
-    try {
-      let user = userOrId;
-  
-      if (typeof userOrId === 'string') {
-        user = await User.findById(userOrId);
-      }
-  
-      if (!user || !user.email) {
-        throw new Error('Utilisateur invalide');
-      }
-  
-      // Créer un transporteur de mail
-      const transporter = require('nodemailer').createTransport({
-        host: process.env.SMTP_HOST,
-        port: process.env.SMTP_PORT,
-        secure: process.env.SMTP_SECURE === 'true',
-        auth: {
-          user: process.env.SMTP_USER,
-          pass: process.env.SMTP_PASSWORD
-        }
-      });
-  
-      // Envoyer l'email
-      await transporter.sendMail({
-        from: `"${process.env.EMAIL_FROM_NAME}" <${process.env.EMAIL_FROM_ADDRESS}>`,
-        to: user.email,
-        subject: 'Bienvenue sur notre plateforme',
-        html: `
-          <h1>Bienvenue !</h1>
-          <p>Bonjour ${user.firstName || ''},</p>
-          <p>Merci de vous être inscrit sur notre plateforme. Nous sommes ravis de vous compter parmi nos utilisateurs.</p>
-          <p>Pour commencer à utiliser nos services, connectez-vous à votre compte :</p>
-          <p><a href="${process.env.FRONTEND_URL}/login">Se connecter</a></p>
-          <p>L'équipe</p>
-        `
-      });
-  
-      return true;
-    } catch (error) {
-      logger.error(`Échec d'envoi de l'email de bienvenue pour ${userOrId}`, error);
-      throw error;
-    }
-  }  
-
-  /**
-   * Méthode pour gérer la vérification de compte
-   */
+ * Méthode pour gérer la vérification de compte
+ */
   static async verifyAccount(req, res, next) {
     try {
       const { token } = req.body;
-
       if (!token) {
         return res.status(400).json({
           message: 'Token de vérification requis'
         });
       }
-
       // Rechercher l'utilisateur par token de vérification
       const user = await User.findOne({ verificationToken: token });
       if (!user) {
@@ -321,21 +219,28 @@ class AuthController {
           message: 'Token de vérification invalide'
         });
       }
-
       // Vérifier si le token n'est pas expiré (24h après création)
       const tokenCreationTime = user.createdAt || new Date(Date.now() - 25 * 60 * 60 * 1000); // Par défaut 25h pour être sûr
       const expirationTime = new Date(tokenCreationTime.getTime() + 24 * 60 * 60 * 1000);
-
       if (Date.now() > expirationTime) {
         return res.status(400).json({
           message: 'Token de vérification expiré'
         });
       }
-
       // Mettre à jour l'utilisateur
       user.isVerified = true;
       user.verificationToken = undefined;
       await user.save();
+
+      // Envoyer l'email de bienvenue
+      Promise.race([
+        NotificationService.sendWelcomeEmail(user.email, user.firstName || ""),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("⏳ Timeout Mailjet")), 6000))
+      ]).then(() => {
+        logger.info(`✅ Email de bienvenue envoyé via notification-service pour ${user.email}`);
+      }).catch((notificationError) => {
+        logger.warn(`⚠️ Échec de l'envoi de l'email de bienvenue via notification-service`, sanitizeError(notificationError));
+      });
 
       res.status(200).json({
         message: 'Compte vérifié avec succès',
@@ -380,34 +285,18 @@ class AuthController {
         await user.save();
 
         try {
-          // Envoyer l'email de réinitialisation
-          // Créer un transporteur de mail
-          const transporter = nodemailer.createTransport({
-            host: process.env.SMTP_HOST,
-            port: process.env.SMTP_PORT,
-            secure: process.env.SMTP_SECURE === 'true',
-            auth: {
-              user: process.env.SMTP_USER,
-              pass: process.env.SMTP_PASSWORD
-            }
+          Promise.race([
+            NotificationService.sendPasswordResetEmail(email, resetCode),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("⏳ Timeout Mailjet")), 6000))
+          ])
+          .then(() => {
+            logger.info(`✅ Email de réinitialisation envoyé pour ${email}`);
+          })
+          .catch((notificationError) => {
+            logger.warn(`⚠️ Échec de l'envoi de l'email de réinitialisation`, sanitizeError(notificationError));
           });
-
-          // Envoyer l'email
-          await transporter.sendMail({
-            from: `"${process.env.EMAIL_FROM_NAME}" <${process.env.EMAIL_FROM_ADDRESS}>`,
-            to: user.email,
-            subject: 'Réinitialisation de votre mot de passe',
-            html: `
-              <h1>Réinitialisation de mot de passe</h1>
-              <p>Bonjour,</p>
-              <p>Vous avez demandé la réinitialisation de votre mot de passe. Voici votre code de réinitialisation :</p>
-              <h2>${resetCode}</h2>
-              <p>Ce code expire dans 1 heure.</p>
-              <p>Si vous n'avez pas demandé cette réinitialisation, ignorez cet email.</p>
-            `
-          });
-        } catch (emailError) {
-          logger.error(`Échec d'envoi de l'email de réinitialisation pour ${email}`, emailError);
+        } catch (notificationError) {
+          logger.warn(`Échec de l'envoi du code de réinitialisation via notification-service pour ${email}`, notificationError);
         }
       }
 
@@ -417,6 +306,83 @@ class AuthController {
       });
     } catch (error) {
       logger.error('Erreur lors de l\'initiation de la réinitialisation de mot de passe', error);
+      next(error);
+    }
+  }
+
+  /**
+  * Méthode pour initier une réinitialisation de mot de passe par SMS
+  */
+  static async initiatePasswordResetBySMS(req, res, next) {
+    try {
+      let { phoneNumber } = req.body;
+  
+      if (!phoneNumber) {
+        return res.status(400).json({
+          message: 'Numéro de téléphone requis'
+        });
+      }
+  
+      console.log(`🔍 Demande de réinitialisation par SMS pour: ${phoneNumber}`);
+      
+      console.log(`📱 Numéro formaté: ${phoneNumber}`);
+  
+      // Rechercher l'utilisateur par numéro de téléphone
+      const user = await User.findOne({ phoneNumber });
+  
+      // Vérification explicite si l'utilisateur existe
+      if (!user) {
+        console.log(`⚠️ Aucun utilisateur trouvé avec le numéro ${phoneNumber}`);
+        
+        // Pour la sécurité, on ne révèle pas cette information à l'utilisateur
+        return res.status(200).json({
+          message: 'Si ce numéro est associé à un compte, un code a été envoyé par SMS.'
+        });
+      }
+  
+      console.log(`✅ Utilisateur trouvé: ${user.email} (${user._id})`);
+  
+      // Générer un code de réinitialisation (code numérique de 6 chiffres)
+      const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const resetCodeExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 heure
+  
+      // Mettre à jour l'utilisateur
+      user.resetCode = resetCode;
+      user.resetCodeExpires = resetCodeExpires;
+      await user.save();
+      
+      console.log(`🔐 Code de réinitialisation généré: ${resetCode} (expire: ${resetCodeExpires})`);
+  
+      // Tentative d'envoi du SMS - sans utiliser Promise.race pour éviter le timeout prématuré
+      try {
+        console.log(`📤 Tentative d'envoi SMS au ${phoneNumber}`);
+        const smsResult = await NotificationService.sendPasswordResetSMS(phoneNumber, resetCode);
+        console.log(`📨 SMS envoyé avec succès:`, smsResult);
+      } catch (notificationError) {
+        // Log détaillé de l'erreur mais on continue le flux
+        console.error(`⚠️ Échec de l'envoi du SMS de réinitialisation:`, {
+          error: notificationError.message,
+          stack: notificationError.stack && notificationError.stack.split('\n').slice(0, 3).join('\n'),
+          phoneNumber,
+          userId: user._id
+        });
+        
+        // On pourrait ajouter ici un mécanisme de fallback:
+        // - Envoi d'un email si l'utilisateur a un email vérifié
+        // - Notification à l'administration pour investigation
+        // - etc.
+      }
+  
+      // Par sécurité, ne pas indiquer si le numéro existe ou non
+      res.status(200).json({
+        message: 'Si ce numéro est associé à un compte, un code a été envoyé par SMS.'
+      });
+    } catch (error) {
+      console.error('Erreur lors de l\'initiation de la réinitialisation de mot de passe par SMS', {
+        error: error.message,
+        stack: error.stack && error.stack.split('\n').slice(0, 3).join('\n'),
+        phoneNumber: req.body.phoneNumber
+      });
       next(error);
     }
   }
@@ -503,6 +469,12 @@ class AuthController {
         });
       }
 
+      // Récupérer l'abonnement actif
+      const subscription = await Subscription.findOne({
+        userId,
+        status: 'active'
+      }).select('plan status startDate endDate');
+
       res.status(200).json({
         user: {
           id: user._id,
@@ -513,7 +485,9 @@ class AuthController {
           role: user.role,
           isVerified: user.isVerified,
           createdAt: user.createdAt,
-          updatedAt: user.updatedAt
+          updatedAt: user.updatedAt,
+          authProvider: user.oauth?.provider || 'local',
+          subscription: subscription || null
         }
       });
     } catch (error) {
@@ -530,27 +504,24 @@ class AuthController {
       const userId = req.user.userId;
       const { firstName, lastName, phoneNumber } = req.body;
 
-      // Valider les entrées
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
       }
 
-      // Rechercher l'utilisateur
       const user = await User.findById(userId);
       if (!user) {
-        return res.status(404).json({
-          message: 'Profil utilisateur non trouvé'
-        });
+        return res.status(404).json({ message: 'Profil utilisateur non trouvé' });
       }
 
-      // Mettre à jour les champs
-      if (firstName !== undefined) user.firstName = firstName;
-      if (lastName !== undefined) user.lastName = lastName;
-      if (phoneNumber !== undefined) user.phoneNumber = phoneNumber;
+      const allowedUpdates = { firstName, lastName, phoneNumber };
+      for (const key in allowedUpdates) {
+        if (allowedUpdates[key] !== undefined) {
+          user[key] = allowedUpdates[key];
+        }
+      }
 
-      user.updatedAt = new Date();
-      await user.save();
+      await user.save(); // ✅ updatedAt sera mis à jour automatiquement
 
       res.status(200).json({
         message: 'Profil mis à jour avec succès',
@@ -561,7 +532,8 @@ class AuthController {
           lastName: user.lastName,
           phoneNumber: user.phoneNumber,
           role: user.role,
-          isVerified: user.isVerified
+          isVerified: user.isVerified,
+          createdAt: user.createdAt // ← utile si tu veux la réafficher
         }
       });
     } catch (error) {
@@ -664,70 +636,25 @@ class AuthController {
         return res.status(401).json({ message: 'Authentification OAuth échouée' });
       }
 
-      const { id, email, firstName, lastName, provider } = req.user;
-      let user;
-      let isNewUser = false;
+      // ✅ Corrigé : extraire les bonnes valeurs
+      const { user, accessToken, refreshToken } = req.user;
+      const { _id, email, firstName, lastName, role, avatar } = user;
 
-      // Rechercher l'utilisateur par email
-      user = await User.findOne({ email });
+      logger.logAuthEvent('oauth_login', { userId: _id, provider: user.oauth?.provider });
 
-      if (!user) {
-        // Créer un nouvel utilisateur
-        isNewUser = true;
-        user = new User({
-          email,
-          firstName: firstName || '',
-          lastName: lastName || '',
-          isVerified: true, // L'email est vérifié par le fournisseur OAuth
-          oauth: {
-            provider,
-            providerId: id
-          },
-          createdAt: new Date()
-        });
-        await user.save();
-      } else {
-        // Mettre à jour les infos OAuth si nécessaire
-        if (!user.oauth || user.oauth.provider !== provider) {
-          user.oauth = {
-            provider,
-            providerId: id
-          };
-          await user.save();
-        }
-      }
-
-      // Générer les tokens
-      const accessToken = JwtConfig.generateAccessToken(user);
-      const refreshToken = JwtConfig.generateRefreshToken(user);
-
-      logger.logAuthEvent('oauth_login', {
-        userId: user._id,
-        provider
-      });
-
-      // Si c'est une première connexion, envoyer un email de bienvenue
-      if (isNewUser) {
-        try {
-          await AuthController.sendWelcomeEmail(user);
-          logger.info(`Email de bienvenue envoyé à ${email}`);
-        } catch (err) {
-          logger.warn(`Échec de l'envoi de l'email de bienvenue à ${email}`, err);
-        }
-      }
-
+      // Redirection JSON ou vers frontend
       const isApiClient = req.get('Accept') === 'application/json';
 
       if (isApiClient) {
-        // Réponse JSON pour un client SPA/mobile
         return res.status(200).json({
           message: 'Authentification OAuth réussie',
           user: {
-            id: user._id,
-            email: user.email,
-            firstName: user.firstName,
-            lastName: user.lastName,
-            role: user.role
+            id: _id,
+            email,
+            firstName,
+            lastName,
+            role,
+            avatar
           },
           tokens: {
             accessToken,
@@ -736,12 +663,12 @@ class AuthController {
         });
       }
 
-      // Redirection avec token (pour client web classique)
       const redirectUrl = new URL(process.env.FRONTEND_URL || 'http://localhost:3000');
       redirectUrl.pathname = '/oauth-callback';
       redirectUrl.searchParams.set('token', accessToken);
 
       return res.redirect(redirectUrl.toString());
+
     } catch (error) {
       logger.error('Erreur lors du traitement de l\'authentification OAuth', error);
       next(error);

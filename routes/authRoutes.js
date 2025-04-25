@@ -63,24 +63,9 @@ router.post('/verify-token', AuthController.verifyToken);
  */
 router.post('/verify-account', AuthController.verifyAccount);
 
-/**
- * @route   POST /auth/forgot-password
- * @desc    Initier une réinitialisation de mot de passe
- * @access  Public
- */
-router.post(
-  '/forgot-password',
-  [
-    body('email').isEmail().withMessage('Adresse email invalide')
-  ],
-  AuthController.initiatePasswordReset
-);
+router.post('/initiate-password-reset', AuthController.initiatePasswordReset);
+router.post('/initiate-password-reset-sms', AuthController.initiatePasswordResetBySMS);
 
-/**
- * @route   POST /auth/reset-password
- * @desc    Réinitialiser le mot de passe avec un code
- * @access  Public
- */
 router.post(
   '/reset-password',
   [
@@ -96,6 +81,7 @@ router.post(
   ],
   AuthController.resetPassword
 );
+
 
 /**
  * @route   POST /auth/logout
