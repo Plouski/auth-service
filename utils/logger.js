@@ -1,4 +1,3 @@
-// utils/logger.js
 const winston = require('winston');
 const { format, createLogger, transports } = winston;
 const { combine, timestamp, printf, colorize, json } = format;
@@ -19,25 +18,21 @@ const logger = createLogger({
   ),
   defaultMeta: { service: 'auth-service' },
   transports: [
-    // Logs d'erreur et plus graves sont enregistrés dans error.log
     new transports.File({ 
       filename: 'logs/error.log', 
       level: 'error',
       maxsize: 5242880, // 5MB
       maxFiles: 5,
     }),
-    // Tous les logs sont enregistrés dans combined.log
     new transports.File({ 
       filename: 'logs/combined.log',
       maxsize: 5242880, // 5MB
       maxFiles: 5,
     }),
   ],
-  // Gestion des exceptions non gérées
   exceptionHandlers: [
     new transports.File({ filename: 'logs/exceptions.log' })
   ],
-  // Ne pas quitter l'application sur une exception non gérée
   exitOnError: false
 });
 

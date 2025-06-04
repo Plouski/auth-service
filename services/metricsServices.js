@@ -21,11 +21,10 @@ const httpDurationHistogram = new client.Histogram({
   registers: [register],
 });
 
-// ➡️ CUSTOM : Inscription utilisateur
 const userRegistrationsTotal = new client.Counter({
   name: 'user_registrations_total',
   help: 'Nombre total d\'inscriptions utilisateur',
-  labelNames: ['status'], // success / failed
+  labelNames: ['status'],
   registers: [register],
 });
 
@@ -33,5 +32,5 @@ module.exports = {
   register,
   httpRequestsTotal,
   httpDurationHistogram,
-  userRegistrationsTotal, // <= on exporte aussi
+  userRegistrationsTotal,
 };
