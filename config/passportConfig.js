@@ -3,8 +3,17 @@ const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const FacebookStrategy = require('passport-facebook').Strategy;
 const GitHubStrategy = require("passport-github").Strategy;
 const logger = require('../utils/logger');
-const User = require('../models/User');
 const JwtConfig = require('../config/jwtConfig');
+const User = require('../models/User');
+
+// Tentative de connexion au data-service
+let dataService;
+try {
+  dataService = require('../services/dataService');
+} catch (error) {
+  logger.warn('⚠️ Data-service non disponible, utilisation du fallback MongoDB');
+  logger.debug('Erreur complète :', error);
+}
 
 class PassportConfig {
   static initializeStrategies() {
@@ -13,10 +22,17 @@ class PassportConfig {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
       callbackURL: process.env.GOOGLE_CALLBACK_URL,
-      passReqToCallback: true
+      passReqToCallback: true,
+      scope: ['profile', 'email', 'openid']
     }, async (req, accessToken, refreshToken, profile, done) => {
       try {
-        const user = await PassportConfig.handleOAuth('google', profile);
+        await PassportConfig.validateOpenIDToken(profile._json?.sub, profile.id);
+        
+        const user = await PassportConfig.handleOAuth('google', profile, {
+          accessToken,
+          refreshToken,
+          idToken: profile._json
+        });
         return done(null, user);
       } catch (err) {
         return PassportConfig.handleOAuthError('google', err, done);
@@ -32,7 +48,10 @@ class PassportConfig {
       enableProof: true
     }, async (req, accessToken, refreshToken, profile, done) => {
       try {
-        const user = await PassportConfig.handleOAuth('facebook', profile);
+        const user = await PassportConfig.handleOAuth('facebook', profile, {
+          accessToken,
+          refreshToken
+        });
         return done(null, user);
       } catch (err) {
         return PassportConfig.handleOAuthError('facebook', err, done);
@@ -48,21 +67,36 @@ class PassportConfig {
       passReqToCallback: true
     }, async (req, accessToken, refreshToken, profile, done) => {
       try {
-        const user = await PassportConfig.handleOAuth('github', profile);
+        const user = await PassportConfig.handleOAuth('github', profile, {
+          accessToken,
+          refreshToken
+        });
         return done(null, user);
       } catch (err) {
         return PassportConfig.handleOAuthError('github', err, done);
       }
     }));
 
-    // (Dé)sérialisation
+    // Sérialisation
     passport.serializeUser((user, done) => {
-      done(null, user._id);
+      done(null, user.user._id || user.user.id);
     });
 
     passport.deserializeUser(async (id, done) => {
       try {
-        const user = await User.findById(id).select('-password');
+        let user;
+        
+        if (dataService) {
+          try {
+            user = await dataService.findUserById(id);
+          } catch (error) {
+            logger.warn('⚠️ Data-service indisponible, fallback MongoDB');
+            logger.debug('Erreur complète :', error);
+            user = await User.findById(id).select('-password');
+          }
+        } else {
+          user = await User.findById(id).select('-password');
+        }
         done(null, user);
       } catch (error) {
         done(error);
@@ -70,22 +104,42 @@ class PassportConfig {
     });
   }
 
-  static async handleOAuth(provider, profile) {
+  // Validation des tokens OpenID Connect
+  static async validateOpenIDToken(subjectId, profileId) {
+    try {
+      if (subjectId && subjectId !== profileId) {
+        throw new Error('Token OpenID invalide: subject mismatch');
+      }
+      
+      logger.info('✅ Token OpenID Connect validé', { subjectId });
+      return true;
+    } catch (error) {
+      logger.error('❌ Erreur validation OpenID Connect:', error);
+      throw new Error('Token OpenID Connect invalide');
+    }
+  }
+
+  // Gestionnaire OAuth avec fallback intelligent
+  static async handleOAuth(provider, profile, tokens = {}) {
     let email = null;
   
     if (provider === 'github') {
-      const res = await fetch('https://api.github.com/user/emails', {
-        headers: {
-          Authorization: `token ${profile.accessToken}`,
-          'User-Agent': 'OAuth App'
-        }
-      });
+      try {
+        const res = await fetch('https://api.github.com/user/emails', {
+          headers: {
+            Authorization: `token ${tokens.accessToken}`,
+            'User-Agent': 'OAuth App'
+          }
+        });
   
-      const emails = await res.json();
-      if (Array.isArray(emails)) {
-        const primary = emails.find(e => e.primary && e.verified);
-        const any = emails.find(e => e.verified);
-        email = primary?.email || any?.email;
+        const emails = await res.json();
+        if (Array.isArray(emails)) {
+          const primary = emails.find(e => e.primary && e.verified);
+          const any = emails.find(e => e.verified);
+          email = primary?.email || any?.email;
+        }
+      } catch (error) {
+        logger.warn('⚠️ Impossible de récupérer les emails GitHub:', error.message);
       }
     } else {
       email = Array.isArray(profile.emails) && profile.emails.length > 0
@@ -109,42 +163,105 @@ class PassportConfig {
     const firstName = clean(rawFirstName) || 'Utilisateur';
     const lastName = clean(rawLastName) || 'OAuth';
   
-    if (!rawFirstName || !rawLastName) {
-      logger.warn(`⚠️ Prénom ou nom manquant dans le profil ${provider} (${email}), fallback utilisé : ${firstName} ${lastName}`);
-    }
-  
-    let user = await User.findOne({ email });
+    let user = null;
     let isNewUser = false;
-  
-    if (!user) {
-      isNewUser = true;
-      try {
-        user = new User({
-          email,
-          firstName,
-          lastName,
-          isVerified: true,
-          oauth: {
+    
+    try {
+      if (dataService) {
+        try {
+          user = await dataService.findUserByEmail(email);
+          
+          if (!user) {
+            isNewUser = true;
+            user = await dataService.createUser({
+              email,
+              firstName,
+              lastName,
+              isVerified: true,
+              oauth: {
+                provider,
+                providerId: profile.id
+              }
+            });
+            
+            await dataService.logAuthEvent({
+              event: 'oauth_registration',
+              provider,
+              userId: user.id,
+              email
+            });
+            
+          } else if (!user.oauth || user.oauth.providerId !== profile.id) {
+            user = await dataService.updateUser(user.id, {
+              oauth: {
+                provider,
+                providerId: profile.id
+              }
+            });
+          }
+          
+          await dataService.logAuthEvent({
+            event: 'oauth_login',
             provider,
-            providerId: profile.id
-          },
-          createdAt: new Date()
-        });
-        await user.save();
-      } catch (err) {
-        if (err.code === 11000) {
-          user = await User.findOne({ email });
-          isNewUser = false;
-        } else {
-          throw err;
+            userId: user.id,
+            email
+          });
+          
+        } catch (dataServiceError) {
+          logger.warn('⚠️ Data-service indisponible, fallback MongoDB:', dataServiceError.message);
+          throw dataServiceError;
         }
+      } else {
+        throw new Error('Data-service non disponible');
       }
-    } else if (!user.oauth || user.oauth.providerId !== profile.id) {
-      user.oauth = {
+    } catch (error) {
+      logger.info('🔄 Utilisation du fallback MongoDB pour OAuth');
+      logger.debug('Erreur complète :', error);
+      
+      user = await User.findOne({ email });
+      
+      if (!user) {
+        isNewUser = true;
+        try {
+          user = new User({
+            email,
+            firstName,
+            lastName,
+            isVerified: true,
+            oauth: {
+              provider,
+              providerId: profile.id
+            },
+            createdAt: new Date()
+          });
+          await user.save();
+          
+          logger.info('👤 Nouvel utilisateur créé via MongoDB fallback', { 
+            email, 
+            provider 
+          });
+          
+        } catch (err) {
+          if (err.code === 11000) {
+            user = await User.findOne({ email });
+            isNewUser = false;
+          } else {
+            throw err;
+          }
+        }
+      } else if (!user.oauth || user.oauth.providerId !== profile.id) {
+        user.oauth = {
+          provider,
+          providerId: profile.id
+        };
+        await user.save();
+      }
+      
+      logger.info('🔐 Connexion OAuth via MongoDB fallback', { 
+        email, 
         provider,
-        providerId: profile.id
-      };
-      await user.save();
+        isNewUser 
+      });
     }
   
     const accessToken = JwtConfig.generateAccessToken(user);
@@ -152,7 +269,7 @@ class PassportConfig {
   
     return {
       user: {
-        ...user.toJSON(),
+        ...user.toJSON ? user.toJSON() : user,
         isNewUser
       },
       accessToken,

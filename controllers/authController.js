@@ -1,9 +1,8 @@
 const logger = require("../utils/logger");
 
 class AuthController {
-  /**
-   * Méthode pour gérer les connexions OAuth
-   */
+  
+  // Méthode pour gérer les connexions OAuth
   static async handleOAuthSuccess(req, res, next) {
     try {
       if (!req.user) {
@@ -12,7 +11,6 @@ class AuthController {
           .json({ message: "Authentification OAuth échouée" });
       }
 
-      // ✅ Corrigé : extraire les bonnes valeurs
       const { user, accessToken, refreshToken } = req.user;
       const { _id, email, firstName, lastName, role, avatar } = user;
 
@@ -21,7 +19,6 @@ class AuthController {
         provider: user.oauth?.provider,
       });
 
-      // Redirection JSON ou vers frontend
       const isApiClient = req.get("Accept") === "application/json";
 
       if (isApiClient) {
