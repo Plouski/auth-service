@@ -1,36 +1,37 @@
 const client = require('prom-client');
 
-const collectDefaultMetrics = client.collectDefaultMetrics;
-const Registry = client.Registry;
+// Configuration de base
+const register = new client.Registry();
+client.collectDefaultMetrics({ register });
 
-const register = new Registry();
-collectDefaultMetrics({ register });
-
-const httpRequestsTotal = new client.Counter({
-  name: 'http_requests_total',
-  help: 'Nombre total de requêtes HTTP',
-  labelNames: ['method', 'route', 'status_code'],
-  registers: [register],
-});
-
-const httpDurationHistogram = new client.Histogram({
+// Métriques temps de réponse HTTP
+const httpRequestDuration = new client.Histogram({
   name: 'http_request_duration_seconds',
-  help: 'Durée des requêtes HTTP en secondes',
+  help: 'Temps de réponse des requêtes HTTP',
   labelNames: ['method', 'route', 'status_code'],
   buckets: [0.1, 0.5, 1, 2, 5],
   registers: [register],
 });
 
-const userRegistrationsTotal = new client.Counter({
-  name: 'user_registrations_total',
-  help: 'Nombre total d\'inscriptions utilisateur',
-  labelNames: ['status'],
+// Métriques état de santé du service
+const serviceHealthStatus = new client.Gauge({
+  name: 'service_health_status',
+  help: 'État de santé du service (1=healthy, 0=unhealthy)',
+  labelNames: ['service_name'],
+  registers: [register],
+});
+
+// Métriques disponibilité des services externes
+const externalServiceHealth = new client.Gauge({
+  name: 'external_service_health',
+  help: 'État de santé des services externes (1=up, 0=down)',
+  labelNames: ['service_name'],
   registers: [register],
 });
 
 module.exports = {
   register,
-  httpRequestsTotal,
-  httpDurationHistogram,
-  userRegistrationsTotal,
+  httpRequestDuration,
+  serviceHealthStatus,
+  externalServiceHealth,
 };

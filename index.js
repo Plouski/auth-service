@@ -12,8 +12,9 @@ const dataService = require("./services/dataService");
 const authRoutes = require("./routes/authRoutes");
 const metricsRoutes = require("./routes/metricsRoutes");
 const {
-  httpRequestsTotal,
-  httpDurationHistogram,
+  httpRequestDuration,
+  serviceHealthStatus,
+  externalServiceHealth,
 } = require("./services/metricsServices");
 
 const app = express();
@@ -119,20 +120,16 @@ console.log("🔥 Lancement du serveur d'authentification...");
     // Rate limiting général
     app.use(SecurityMiddleware.createAdvancedRateLimit());
 
-    // ───────────── Middleware Prometheus ─────────────
+    // ───────────── Middleware de monitoring temps de réponse ─────────────
     app.use((req, res, next) => {
       const start = process.hrtime();
+
       res.on("finish", () => {
         const duration = process.hrtime(start);
         const seconds = duration[0] + duration[1] / 1e9;
 
-        httpRequestsTotal.inc({
-          method: req.method,
-          route: req.path,
-          status_code: res.statusCode,
-        });
-
-        httpDurationHistogram.observe(
+        // Mesurer le temps de réponse
+        httpRequestDuration.observe(
           {
             method: req.method,
             route: req.path,
@@ -165,31 +162,36 @@ console.log("🔥 Lancement du serveur d'authentification...");
     app.use("/auth", authRoutes);
     app.use("/metrics", metricsRoutes);
 
-    // ───────────── Route de santé ─────────────
+    // ───────────── Route de santé avec métriques ─────────────
     app.get("/health", async (req, res) => {
       const health = {
         status: "healthy",
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
-        environment: process.env.NODE_ENV || "development",
-        version: process.env.npm_package_version || "1.0.0",
         services: {},
       };
 
       try {
         await dataService.healthCheck();
         health.services.dataService = "healthy";
+        externalServiceHealth.set({ service_name: "data-service" }, 1);
       } catch (error) {
         health.services.dataService = "unhealthy";
         health.status = "degraded";
+        externalServiceHealth.set({ service_name: "data-service" }, 0);
       }
 
       if (mongoose.connection.readyState === 1) {
         health.services.mongodb = "healthy";
+        externalServiceHealth.set({ service_name: "mongodb" }, 1);
       } else {
         health.services.mongodb = "unhealthy";
         health.status = "degraded";
+        externalServiceHealth.set({ service_name: "mongodb" }, 0);
       }
+
+      const isHealthy = health.status === "healthy" ? 1 : 0;
+      serviceHealthStatus.set({ service_name: "auth-service" }, isHealthy);
 
       const statusCode = health.status === "healthy" ? 200 : 503;
       res.status(statusCode).json(health);
@@ -295,7 +297,6 @@ console.log("🔥 Lancement du serveur d'authentification...");
         `❤️ Health check disponible sur: http://localhost:${PORT}/health`
       );
     });
-    
   } catch (err) {
     console.error("❌ Erreur fatale au démarrage :", err.message);
     console.error(err.stack);
