@@ -160,8 +160,6 @@ class PassportConfig {
     };
   }
   
-  
-
   static handleOAuthError(provider, error, done) {
     logger.error(`❌ Erreur OAuth ${provider}:`, error);
     return done(error, false);
